@@ -3,7 +3,7 @@ name: Yahoo News Scraper (Integrated)
 on:
   workflow_dispatch: {}            # 手動実行
   schedule:
-    # 15:10 JST == 06:10 UTC (本文・コメント取得の時刻に合わせる)
+    # 毎日 15:10 JST == 06:10 UTC に実行
     - cron: '10 6 * * *'
 
 permissions:
@@ -26,10 +26,10 @@ jobs:
           cache: 'pip'
 
       - name: Install system deps (Chrome)
+        # Selenium/Chromeをヘッドレス環境で実行するために必要な依存関係をインストール
         run: |
-          # Selenium/Chromeのインストール処理はそのまま残します
           sudo apt-get update
-          sudo apt-get install -y wget unzip xvfb libxi6 curl
+          sudo apt-get install -y wget unzip xvfb libxi6 curl libnss3 libatk-bridge2.0-0
           wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get -f install -y
           google-chrome --version
@@ -37,14 +37,13 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          # requirements2.txt (統合された依存関係リスト) をインストール
-          pip install -r requirements2.txt
+          pip install -r requirements.txt
 
       - name: Run Integrated Scraper
         env:
-          # main1.pyとmain2.pyの両方の認証に対応するため、両方の環境変数を残します
+          # GOOGLE_CREDENTIALS: main2.pyで使用されていた認証情報
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          # GCP_SERVICE_ACCOUNT_KEY: main1.pyで使用されていた認証情報 (フォールバック用)
           GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
         run: |
-          # 統合されたスクリプトを実行
           python integrated_main.py
