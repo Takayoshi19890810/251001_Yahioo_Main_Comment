@@ -2,10 +2,10 @@
 """
 統合スクリプト：
 1. Yahoo!ニュース検索結果から記事リストを取得。
-2. そのリストを一時スプレッドシート（SOURCE_SPREADSHEET_ID）に追記。
+2. そのリストを単一スプレッドシートの「Yahoo」シートに追記。
 3. 追記された記事リストから、前日15:00〜当日14:59:59の分を抽出し、
    記事本文とコメントを取得。
-4. 取得した詳細データを最終スプレッドシート（DEST_SPREADSHEET_ID）の当日タブに書き込み。
+4. 取得した詳細データを同じスプレッドシートの当日日付タブに書き込み。
 
 認証: GitHub Secretsの GOOGLE_CREDENTIALS または GCP_SERVICE_ACCOUNT_KEY を使用。
 """
@@ -29,14 +29,16 @@ from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 
 # ====== 設定 ======
-# 【ステップ1】ニュースリスト取得用の設定
+# 指定された単一のスプレッドシートID
+SHARED_SPREADSHEET_ID = "1vy0quUujxw5hagwATB5W87wD4tVTd5d8qxgt8IekRTY" 
+
+# 【ステップ1, 2】ニュースリスト取得用の設定
 KEYWORD = "日産"
-# main1.py のリスト出力先 (main2.py の コピー元)
-SOURCE_SPREADSHEET_ID = "1RglATeTbLU1SqlfXnNToJqhXLdNoHCdePldioKDQgU8"
+SOURCE_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 SOURCE_SHEET_NAME = "Yahoo"
 
 # 【ステップ3, 4】本文・コメントの出力先
-DEST_SPREADSHEET_ID = "1UVwusLRcL4cZ3J9hnO6Z-f_d_sTFmocQJ9DcX3-v9u0"
+DEST_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 
 # 本文・コメント取得設定
 MAX_BODY_PAGES = 10
@@ -95,18 +97,22 @@ def build_gspread_client() -> gspread.Client:
     またはローカルの credentials.json を使用します。
     """
     try:
-        creds_str = os.environ.get("GOOGLE_CREDENTIALS") or os.environ.get("GCP_SERVICE_ACCOUNT_KEY")
+        # main2.pyの認証方式 (GOOGLE_CREDENTIALS) を優先
+        creds_str = os.environ.get("GOOGLE_CREDENTIALS")
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         
         if creds_str:
             info = json.loads(creds_str)
-            # oauth2clientを使用 (main2.pyの認証方式)
             credentials = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
             return gspread.authorize(credentials)
         else:
-            # gspreadのservice_account_from_dictを使用 (main1.pyの認証方式)
-            # ローカルファイル認証のフォールバック (main1.pyのロジック)
-            credentials = json.load(open('credentials.json'))
+            # main1.pyの認証方式 (GCP_SERVICE_ACCOUNT_KEY または ローカルファイル)
+            creds_str_alt = os.environ.get("GCP_SERVICE_ACCOUNT_KEY")
+            if creds_str_alt:
+                credentials = json.loads(creds_str_alt)
+            else:
+                credentials = json.load(open('credentials.json'))
+                
             return gspread.service_account_from_dict(credentials)
             
     except Exception as e:
@@ -126,9 +132,8 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     options.add_argument("--headless")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
-    options.add_argument("--window-size=1280,1024") # ヘッドレスで安定させるため
+    options.add_argument("--window-size=1280,1024")
 
-    # Chrome WebDriverのセットアップと起動
     try:
         driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
     except Exception as e:
@@ -137,7 +142,7 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
         
     search_url = f"https://news.yahoo.co.jp/search?p={keyword}&ei=utf-8&categories=domestic,world,business,it,science,life,local"
     driver.get(search_url)
-    time.sleep(5)  # ページのロードを待つ
+    time.sleep(5) 
 
     soup = BeautifulSoup(driver.page_source, "html.parser")
     driver.quit()
@@ -162,13 +167,12 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
             if date_str:
                 date_str = re.sub(r'\([月火水木金土日]\)', '', date_str).strip()
                 try:
-                    # main1.py のロジックを使用
                     dt_obj = datetime.strptime(date_str, "%Y/%m/%d %H:%M")
                     formatted_date = format_datetime(dt_obj)
                 except:
                     formatted_date = date_str
 
-            # 引用元（ソース） - main1.pyのロジックをそのまま使用
+            # 引用元（ソース）
             source_text = ""
             source_tag = article.find("div", class_="sc-n3vj8g-0 yoLqH")
             if source_tag:
@@ -200,7 +204,7 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
 
 def write_news_list_to_source(gc: gspread.Client, articles: list[dict]):
     """
-    【ステップ2】取得した記事リストをSOURCE_SPREADSHEETに追記します。
+    【ステップ2】取得した記事リストをSOURCE_SPREADSHEETの'Yahoo'シートに追記します。
     """
     for attempt in range(5):
         try:
@@ -237,6 +241,7 @@ def write_news_list_to_source(gc: gspread.Client, articles: list[dict]):
 
 # --- DESTシート操作 (main2.py) ---
 def ensure_today_sheet(sh: gspread.Spreadsheet, today_tab: str) -> gspread.Worksheet:
+    """当日タブが存在しない場合は作成します"""
     try:
         ws = sh.worksheet(today_tab)
     except gspread.WorksheetNotFound:
@@ -244,16 +249,19 @@ def ensure_today_sheet(sh: gspread.Spreadsheet, today_tab: str) -> gspread.Works
     return ws
 
 def get_existing_urls(ws: gspread.Worksheet) -> Set[str]:
-    vals = ws.col_values(3)  # C列=URL
+    """DESTシートのC列（URL）から既存URLを取得"""
+    vals = ws.col_values(3)
     return set(vals[1:] if len(vals) > 1 else [])
 
 def ensure_ae_header(ws: gspread.Worksheet) -> None:
+    """A〜E列のヘッダーを保証"""
     head = ws.row_values(1)
     target = ["ソース", "タイトル", "URL", "投稿日", "掲載元"]
-    if head != target:
+    if head[:len(target)] != target:
         ws.update('A1', [target])
 
 def ensure_body_comment_headers(ws: gspread.Worksheet, max_comments: int) -> None:
+    """F列以降の本文・コメントヘッダーを保証"""
     current = ws.row_values(1)
     base = ["ソース", "タイトル", "URL", "投稿日", "掲載元"]
     body_headers = [f"本文({i}ページ)" for i in range(1, 11)]
@@ -274,7 +282,9 @@ def transfer_a_to_e(gc: gspread.Client, dest_ws: gspread.Worksheet) -> int:
     rows = ws_src.get('A:D')
 
     now = jst_now()
+    # 前日15:00:00 JST
     start = (now - timedelta(days=1)).replace(hour=15, minute=0, second=0, microsecond=0)
+    # 当日14:59:59 JST
     end = now.replace(hour=14, minute=59, second=59, microsecond=0)
 
     ensure_ae_header(dest_ws)
@@ -296,6 +306,7 @@ def transfer_a_to_e(gc: gspread.Client, dest_ws: gspread.Worksheet) -> int:
         if url in existing:
             continue # DESTシートに重複
 
+        # A:ソース / B:タイトル / C:URL / D:投稿日 / E:掲載元
         to_append.append(["Yahoo", title, url, format_yy_m_d_hm(dt), site])
 
     if to_append:
@@ -305,7 +316,7 @@ def transfer_a_to_e(gc: gspread.Client, dest_ws: gspread.Worksheet) -> int:
 
 # --- 本文・コメント取得 (main2.py) ---
 def fetch_article_pages(base_url: str) -> Tuple[str, str, List[str]]:
-    # main2.pyのロジック
+    """記事本文を取得します"""
     title = "取得不可"
     article_date = "取得不可"
     bodies: List[str] = []
@@ -317,6 +328,7 @@ def fetch_article_pages(base_url: str) -> Tuple[str, str, List[str]]:
         except Exception:
             break
         soup = BeautifulSoup(res.text, "html.parser")
+        
         if page == 1:
             t = soup.find("title")
             if t and t.get_text(strip=True):
@@ -330,6 +342,7 @@ def fetch_article_pages(base_url: str) -> Tuple[str, str, List[str]]:
         if article:
             ps = article.find_all("p")
             body_text = "\n".join(p.get_text(strip=True) for p in ps if p.get_text(strip=True))
+        
         if not body_text:
             main = soup.find("main")
             if main:
@@ -342,7 +355,7 @@ def fetch_article_pages(base_url: str) -> Tuple[str, str, List[str]]:
     return title, article_date, bodies
 
 def fetch_comments_with_selenium(base_url: str) -> List[str]:
-    # main2.pyのロジック
+    """記事コメントをSeleniumで取得します"""
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -350,11 +363,9 @@ def fetch_comments_with_selenium(base_url: str) -> List[str]:
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1280,2000")
     
-    # WebDriverの初期化に失敗する可能性があるので、Serviceを使用しない方法に変更 (ChromeDriverManagerがSelenium 4.xでは不要なため)
     try:
         driver = webdriver.Chrome(options=options)
     except Exception:
-        # ChromeDriverManagerが必要な場合はここで再試行（環境依存）
         try:
             driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
         except Exception as e:
@@ -431,7 +442,6 @@ def write_bodies_and_comments(ws: gspread.Worksheet) -> None:
                 max_comments = cnt
         except Exception as e:
             print(f"    ! Error: {e}")
-            # エラー時は空欄でスキップ
             rows_data.append(([""] * MAX_BODY_PAGES) + [0])
 
     # データ行の長さを最大コメント数に合わせて調整
@@ -464,26 +474,25 @@ def main():
         return
 
     # 2. リストを一時的なSOURCEシートに書き込み
-    print(f"\n📄 SOURCE Spreadsheet: {SOURCE_SPREADSHEET_ID} / Sheet: {SOURCE_SHEET_NAME}")
+    print(f"\n📄 Spreadsheet ID: {SHARED_SPREADSHEET_ID} / Sheet: {SOURCE_SHEET_NAME}")
     write_news_list_to_source(gc, yahoo_news_articles)
     
     # 3. DESTシートを準備
     dest_sh = gc.open_by_key(DEST_SPREADSHEET_ID)
-    today_tab = jst_now().strftime("%y%m%d")
+    today_tab = jst_now().strftime("%y%m%d") # yymmdd 形式のタブ名
     ws = ensure_today_sheet(dest_sh, today_tab)
-    print(f"\n📄 DEST Spreadsheet: {DEST_SPREADSHEET_ID} / Sheet: {today_tab}")
+    print(f"\n📄 DEST Sheet: {today_tab}")
 
     # 4. SOURCEからDESTへ「前日15:00〜当日14:59:59」のデータを転送 (A〜E列)
     added = transfer_a_to_e(gc, ws)
     print(f"📝 DESTシートに新規追加: {added} 行")
     
     # 5. DESTシートの記事に対して本文・コメントを取得 (F列以降)
-    if added > 0:
-        # 新しく追加された行だけでなく、その日のタブの全行に対して本文・コメント取得を行う
-        # これにより、前回の実行で取得できなかった行もカバーできる可能性があります。
+    # 当日タブの全行に対して実行し、前回の未完了分もカバーします。
+    if ws.get_all_values(value_render_option='UNFORMATTED_VALUE'):
         write_bodies_and_comments(ws)
     else:
-        print("⚠️ 新しい記事がDESTシートに追加されなかったため、本文・コメントの取得をスキップします。")
+        print("⚠️ 当日シートに行が存在しないため、本文・コメントの取得をスキップします。")
 
 
 if __name__ == "__main__":
