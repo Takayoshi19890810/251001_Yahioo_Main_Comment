@@ -28,6 +28,9 @@ jobs:
       - name: Install system deps (Chrome)
         # Selenium/Chromeをヘッドレス環境で実行するために必要な依存関係をインストール
         run: |
+          # 警告を回避するため、既存のシステムパスにあるChromedriverを削除
+          sudo rm -f /usr/bin/chromedriver /usr/local/bin/chromedriver
+          
           sudo apt-get update
           sudo apt-get install -y wget unzip xvfb libxi6 curl libnss3 libatk-bridge2.0-0
           wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
