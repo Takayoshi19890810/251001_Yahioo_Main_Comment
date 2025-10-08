@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-統合スクリプト：
+統合スクリプト（修正版: コメントは「1ページ=10件」をJSONで1セルに格納）：
 1. Yahoo!ニュース検索結果から記事リストを取得。
 2. そのリストを単一スプレッドシートの「Yahoo」シートに追記。
 3. 追記された記事リストから、前日15:00〜当日14:59:59の分を抽出し、
    記事本文とコメントを取得。
 4. 取得した詳細データを同じスプレッドシートの当日日付タブに書き込み。
+   - 本文: F..O（最大10ページ）
+   - コメント数: P
+   - コメント本文: Q..（1ページ=最大10件をJSON文字列で1セルにまとめる）
 
-認証: GitHub Secretsの GOOGLE_CREDENTIALS または GCP_SERVICE_ACCOUNT_KEY を使用。
+認証: 環境変数 GOOGLE_CREDENTIALS または GCP_SERVICE_ACCOUNT_KEY を使用（fallback: credentials.json）
 """
 
 import os
@@ -15,6 +18,7 @@ import json
 import time
 import re
 import random
+from math import ceil
 from datetime import datetime, timedelta, timezone
 from typing import List, Tuple, Optional, Set
 
@@ -43,17 +47,17 @@ DEST_SPREADSHEET_ID = SHARED_SPREADSHEET_ID
 # 本文・コメント取得設定
 MAX_BODY_PAGES = 10
 REQ_HEADERS = {"User-Agent": "Mozilla/5.0"}
-MAX_TOTAL_COMMENTS = 5000
+MAX_TOTAL_COMMENTS = 5000  # 暴走防止
 
 TZ_JST = timezone(timedelta(hours=9))
 
-# ====== 共通ユーティリティ ======
 
+# ====== 共通ユーティリティ ======
 def jst_now() -> datetime:
     return datetime.now(TZ_JST)
 
 def format_datetime(dt_obj) -> str:
-    """datetimeオブジェクトを指定の形式で文字列に変換します (YYYY/MM/DD HH:MM)"""
+    """datetimeオブジェクトを 'YYYY/MM/DD HH:MM' に整形"""
     return dt_obj.strftime("%Y/%m/%d %H:%M")
 
 def format_yy_m_d_hm(dt: datetime) -> str:
@@ -69,7 +73,8 @@ def parse_post_date(raw, today_jst: datetime) -> Optional[datetime]:
     ソースC列（投稿日）を JST datetime に変換
     許容: "MM/DD HH:MM"（年は当年補完）, "YYYY/MM/DD HH:MM", "YYYY/MM/DD HH:MM:SS", Excelシリアル
     """
-    if raw is None: return None
+    if raw is None:
+        return None
     if isinstance(raw, str):
         s = raw.strip()
         for fmt in ("%m/%d %H:%M", "%Y/%m/%d %H:%M", "%Y/%m/%d %H:%M:%S"):
@@ -88,8 +93,14 @@ def parse_post_date(raw, today_jst: datetime) -> Optional[datetime]:
         return raw.astimezone(TZ_JST) if raw.tzinfo else raw.replace(tzinfo=TZ_JST)
     return None
 
-# ====== 認証 ======
+def chunk(lst: List[str], size: int) -> List[List[str]]:
+    """リストを size 件ごとのチャンクに分割"""
+    if size <= 0:
+        return [lst]
+    return [lst[i:i + size] for i in range(0, len(lst), size)]
 
+
+# ====== 認証 ======
 def build_gspread_client() -> gspread.Client:
     """
     gspreadクライアントを構築します。
@@ -97,32 +108,27 @@ def build_gspread_client() -> gspread.Client:
     またはローカルの credentials.json を使用します。
     """
     try:
-        # main2.pyの認証方式 (GOOGLE_CREDENTIALS) を優先
         creds_str = os.environ.get("GOOGLE_CREDENTIALS")
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        
         if creds_str:
             info = json.loads(creds_str)
             credentials = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
             return gspread.authorize(credentials)
         else:
-            # main1.pyの認証方式 (GCP_SERVICE_ACCOUNT_KEY または ローカルファイル)
             creds_str_alt = os.environ.get("GCP_SERVICE_ACCOUNT_KEY")
             if creds_str_alt:
                 credentials = json.loads(creds_str_alt)
             else:
-                credentials = json.load(open('credentials.json'))
-                
+                with open('credentials.json', 'r', encoding='utf-8') as f:
+                    credentials = json.load(f)
             return gspread.service_account_from_dict(credentials)
-            
     except Exception as e:
         raise RuntimeError(f"Google認証に失敗: {e}")
 
 
 # =========================================================================
-# 【ステップ1】 Yahoo!ニュースリスト取得 (main1.pyのロジック)
+# 【ステップ1】 Yahoo!ニュースリスト取得
 # =========================================================================
-
 def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     """
     Seleniumを使用してYahoo!ニュースから指定されたキーワードの記事を取得します。
@@ -135,7 +141,6 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
     options.add_argument("--window-size=1280,1024")
 
     try:
-        # ChromeDriverManager().install()は実行パスを返す。これをServiceに渡す。
         driver_path = ChromeDriverManager().install()
         service = Service(driver_path)
         driver = webdriver.Chrome(service=service, options=options)
@@ -143,9 +148,12 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
         print(f"❌ WebDriverの初期化に失敗しました: {e}")
         return []
         
-    search_url = f"https://news.yahoo.co.jp/search?p={keyword}&ei=utf-8&categories=domestic,world,business,it,science,life,local"
+    search_url = (
+        f"https://news.yahoo.co.jp/search?p={keyword}"
+        f"&ei=utf-8&categories=domestic,world,business,it,science,life,local"
+    )
     driver.get(search_url)
-    time.sleep(5) 
+    time.sleep(5)
 
     soup = BeautifulSoup(driver.page_source, "html.parser")
     driver.quit()
@@ -158,11 +166,9 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
             # タイトル
             title_tag = article.find("div", class_=re.compile("sc-3ls169-0"))
             title = title_tag.text.strip() if title_tag else ""
-            
             # URL
             link_tag = article.find("a", href=True)
             url = link_tag["href"] if link_tag else ""
-            
             # 投稿日
             time_tag = article.find("time")
             date_str = time_tag.text.strip() if time_tag else ""
@@ -172,9 +178,8 @@ def get_yahoo_news_with_selenium(keyword: str) -> list[dict]:
                 try:
                     dt_obj = datetime.strptime(date_str, "%Y/%m/%d %H:%M")
                     formatted_date = format_datetime(dt_obj)
-                except:
+                except Exception:
                     formatted_date = date_str
-
             # 引用元（ソース）
             source_text = ""
             source_tag = article.find("div", class_="sc-n3vj8g-0 yoLqH")
@@ -221,16 +226,16 @@ def write_news_list_to_source(gc: gspread.Client, articles: list[dict]):
             existing_data = worksheet.get_all_values()
             existing_urls = set(row[1] for row in existing_data[1:] if len(row) > 1)
 
-            # A:タイトル / B:URL / C:投稿日 / D:引用元 の形式で新しいデータを作成
-            new_data = [[a['タイトル'], a['URL'], a['投稿日'], a['引用元']] for a in articles if a['URL'] not in existing_urls]
-            
+            new_data = [
+                [a['タイトル'], a['URL'], a['投稿日'], a['引用元']]
+                for a in articles if a['URL'] not in existing_urls
+            ]
             if new_data:
                 worksheet.append_rows(new_data, value_input_option='USER_ENTERED')
                 print(f"✅ SOURCEシートに {len(new_data)} 件追記しました。")
             else:
                 print("⚠️ SOURCEシートに追記すべき新しいデータはありません。")
             return
-            
         except gspread.exceptions.APIError as e:
             print(f"⚠️ Google API Error (attempt {attempt + 1}/5): {e}")
             time.sleep(5 + random.random() * 5)
@@ -239,16 +244,15 @@ def write_news_list_to_source(gc: gspread.Client, articles: list[dict]):
 
 
 # =========================================================================
-# 【ステップ3, 4】 本文・コメント取得 (main2.pyのロジック)
+# 【ステップ3, 4】 本文・コメント取得
 # =========================================================================
-
-# --- DESTシート操作 (main2.py) ---
+# --- DESTシート操作 ---
 def ensure_today_sheet(sh: gspread.Spreadsheet, today_tab: str) -> gspread.Worksheet:
-    """当日タブが存在しない場合は作成します"""
+    """当日タブが存在しない場合は作成（セル上限対策で小さめに作成）"""
     try:
         ws = sh.worksheet(today_tab)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=today_tab, rows="3000", cols="300")
+        ws = sh.add_worksheet(title=today_tab, rows="300", cols="30")
     return ws
 
 def get_existing_urls(ws: gspread.Worksheet) -> Set[str]:
@@ -261,23 +265,27 @@ def ensure_ae_header(ws: gspread.Worksheet) -> None:
     head = ws.row_values(1)
     target = ["ソース", "タイトル", "URL", "投稿日", "掲載元"]
     if head[:len(target)] != target:
-        # 修正: 名前付き引数を使用
         ws.update(range_name='A1', values=[target])
 
-def ensure_body_comment_headers(ws: gspread.Worksheet, max_comments: int) -> None:
-    """F列以降の本文・コメントヘッダーを保証"""
-    current = ws.row_values(1)
+def ensure_body_comment_headers(ws: gspread.Worksheet, max_comment_pages: int) -> None:
+    """
+    1行目に以下のヘッダーを整える
+    - F..O: 本文(1〜10ページ)
+    - P: コメント数
+    - Q..: コメント（ページ単位JSON）。例: コメント(1ページJSON), コメント(2ページJSON)...
+    """
     base = ["ソース", "タイトル", "URL", "投稿日", "掲載元"]
-    body_headers = [f"本文({i}ページ)" for i in range(1, 11)]
-    comments_count = ["コメント数"]
-    comment_headers = [f"コメント{i}" for i in range(1, max(1, max_comments) + 1)]
-    target = base + body_headers + comments_count + comment_headers
+    body_headers = [f"本文({i}ページ)" for i in range(1, MAX_BODY_PAGES + 1)]  # F..O（10列）
+    comments_count = ["コメント数"]  # P
+    comment_page_headers = [f"コメント({i}ページJSON)" for i in range(1, max(1, max_comment_pages) + 1)]  # Q..
+    target = base + body_headers + comments_count + comment_page_headers
+
+    current = ws.row_values(1)
     if current != target:
-        # 修正: 名前付き引数を使用
         ws.update(range_name='A1', values=[target])
 
 
-# --- データ転送 (main2.py) ---
+# --- データ転送 ---
 def transfer_a_to_e(gc: gspread.Client, dest_ws: gspread.Worksheet) -> int:
     """
     SOURCEシートから「前日15:00〜当日14:59:59」のデータをDESTシートのA〜E列に転送
@@ -287,9 +295,7 @@ def transfer_a_to_e(gc: gspread.Client, dest_ws: gspread.Worksheet) -> int:
     rows = ws_src.get('A:D')
 
     now = jst_now()
-    # 前日15:00:00 JST
     start = (now - timedelta(days=1)).replace(hour=15, minute=0, second=0, microsecond=0)
-    # 当日14:59:59 JST
     end = now.replace(hour=14, minute=59, second=59, microsecond=0)
 
     ensure_ae_header(dest_ws)
@@ -297,19 +303,20 @@ def transfer_a_to_e(gc: gspread.Client, dest_ws: gspread.Worksheet) -> int:
 
     to_append: List[List[str]] = []
     for i, r in enumerate(rows):
-        if i == 0: continue
+        if i == 0:
+            continue
         title = r[0].strip() if len(r) > 0 and r[0] else ""
         url = r[1].strip() if len(r) > 1 and r[1] else ""
         posted_raw = r[2] if len(r) > 2 else ""
         site = r[3].strip() if len(r) > 3 and r[3] else ""
-        if not title or not url: continue
+        if not title or not url:
+            continue
         
         dt = parse_post_date(posted_raw, now)
         if not dt or not (start <= dt <= end):
-            continue # 時間範囲外
-            
+            continue  # 時間範囲外
         if url in existing:
-            continue # DESTシートに重複
+            continue  # 重複
 
         # A:ソース / B:タイトル / C:URL / D:投稿日 / E:掲載元
         to_append.append(["Yahoo", title, url, format_yy_m_d_hm(dt), site])
@@ -319,9 +326,9 @@ def transfer_a_to_e(gc: gspread.Client, dest_ws: gspread.Worksheet) -> int:
     return len(to_append)
 
 
-# --- 本文・コメント取得 (main2.py) ---
+# --- 本文・コメント取得 ---
 def fetch_article_pages(base_url: str) -> Tuple[str, str, List[str]]:
-    """記事本文を取得します"""
+    """記事本文を取得します（最大 MAX_BODY_PAGES ページ）"""
     title = "取得不可"
     article_date = "取得不可"
     bodies: List[str] = []
@@ -347,7 +354,6 @@ def fetch_article_pages(base_url: str) -> Tuple[str, str, List[str]]:
         if article:
             ps = article.find_all("p")
             body_text = "\n".join(p.get_text(strip=True) for p in ps if p.get_text(strip=True))
-        
         if not body_text:
             main = soup.find("main")
             if main:
@@ -360,7 +366,7 @@ def fetch_article_pages(base_url: str) -> Tuple[str, str, List[str]]:
     return title, article_date, bodies
 
 def fetch_comments_with_selenium(base_url: str) -> List[str]:
-    """記事コメントをSeleniumで取得します"""
+    """記事コメントをSeleniumで全ページ巡回して取得します"""
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -369,7 +375,6 @@ def fetch_comments_with_selenium(base_url: str) -> List[str]:
     options.add_argument("--window-size=1280,2000")
     
     try:
-        # ChromeDriverManager().install()を使用し、互換性のあるドライバーを確実に見つける
         driver_path = ChromeDriverManager().install()
         service = Service(driver_path)
         driver = webdriver.Chrome(service=service, options=options)
@@ -401,11 +406,14 @@ def fetch_comments_with_selenium(base_url: str) -> List[str]:
                 p_candidates.extend(soup.select(sel))
 
             page_comments = [p.get_text(strip=True) for p in p_candidates if p.get_text(strip=True)]
-            page_comments = list(dict.fromkeys(page_comments))
+            page_comments = list(dict.fromkeys(page_comments))  # ページ内重複除去
 
-            if not page_comments: break
+            if not page_comments:
+                break
 
-            if last_tail is not None and page_comments and page_comments[0] == last_tail: break
+            # 前ページ末尾と今ページ先頭が同じなら終了（終端判定）
+            if last_tail is not None and page_comments and page_comments[0] == last_tail:
+                break
 
             comments.extend(page_comments)
 
@@ -415,76 +423,88 @@ def fetch_comments_with_selenium(base_url: str) -> List[str]:
 
             last_tail = page_comments[-1]
             page += 1
-
     finally:
         driver.quit()
 
     return comments
 
+
 def write_bodies_and_comments(ws: gspread.Worksheet) -> None:
     """
-    DESTシートのF列以降に本文とコメントを書き込み
+    DESTシートのF列以降に本文とコメントを書き込み。
+    - 本文: F..O（最大10ページ）
+    - コメント数: P
+    - コメント本文: Q..（1ページ=最大10件をJSONで1セル）
     """
-    urls = ws.col_values(3)[1:]
+    urls = ws.col_values(3)[1:]  # C列（URL）の2行目以降
     total = len(urls)
     print(f"🔎 本文・コメント取得対象URL: {total} 件")
-    if total == 0: return
+    if total == 0:
+        return
 
     rows_data: List[List[str]] = []
-    max_comments = 0
-    # スプレッドシートの行番号(2から開始)
-    for row_idx, url in enumerate(urls, start=2):
-        print(f"  - ({row_idx-1}/{total}) {url}")
+    max_comment_pages = 0  # 行中の最大コメントページ数（=列数決定に使用）
+
+    for idx, url in enumerate(urls, start=2):
+        print(f"  - ({idx-1}/{total}) {url}")
         try:
             _title, _date, bodies = fetch_article_pages(url)
             comments = fetch_comments_with_selenium(url)
 
+            # 本文セル（最大 MAX_BODY_PAGES にフィット）
             body_cells = bodies[:MAX_BODY_PAGES] + [""] * (MAX_BODY_PAGES - len(bodies))
+
+            # コメントは 10件=1ページでチャンク化し、各ページをJSON文字列にまとめる
+            comment_pages = chunk(comments, 10)  # [[c1..c10], [c11..c20], ...]
+            json_per_page = [json.dumps(pg, ensure_ascii=False) for pg in comment_pages]
             cnt = len(comments)
-            row = body_cells + [cnt] + comments
+
+            # 行データ: [本文x10, コメント数, コメントページJSONxN]
+            row = body_cells + [cnt] + json_per_page
             rows_data.append(row)
-            if cnt > max_comments:
-                max_comments = cnt
+
+            # 列ヘッダー決定のため、最大ページ数を更新
+            if len(comment_pages) > max_comment_pages:
+                max_comment_pages = len(comment_pages)
+
         except Exception as e:
             print(f"    ! Error: {e}")
-            rows_data.append(([""] * MAX_BODY_PAGES) + [0])
+            rows_data.append(([""] * MAX_BODY_PAGES) + [0])  # コメントJSON列は0ページの場合追加不要
 
-    # データ行の長さを最大コメント数に合わせて調整
-    need_cols = MAX_BODY_PAGES + 1 + max_comments
+    # ヘッダー整備（コメントページ数に応じて可変）
+    ensure_body_comment_headers(ws, max_comment_pages=max_comment_pages)
+
+    # 各行の長さを「本文(10)+コメント数(1)+max_comment_pages」に合わせて右側をパディング
+    need_cols = MAX_BODY_PAGES + 1 + max_comment_pages
     for i in range(len(rows_data)):
         if len(rows_data[i]) < need_cols:
             rows_data[i].extend([""] * (need_cols - len(rows_data[i])))
 
-    # ヘッダー整備
-    ensure_body_comment_headers(ws, max_comments=max_comments)
-
-    # F2 から一括更新
+    # F2 から一括更新（本文=10列, コメント数=1列, コメントページJSON=max_comment_pages列）
     if rows_data:
         ws.update(range_name="F2", values=rows_data)
-        print(f"✅ F列以降に本文・コメントを書き込み完了: {len(rows_data)} 行")
+        print(f"✅ 本文・コメント(JSON/ページ単位) 書き込み完了: {len(rows_data)} 行（最大コメントページ={max_comment_pages}）")
 
 
 # =========================================================================
 # 【メイン処理】
 # =========================================================================
-
 def main():
     gc = build_gspread_client()
     
     # 1. Yahoo!ニュースリストを取得
     yahoo_news_articles = get_yahoo_news_with_selenium(KEYWORD)
-    
     if not yahoo_news_articles:
         print("💡 新しい記事が見つかりませんでした。処理を終了します。")
         return
 
-    # 2. リストを一時的なSOURCEシートに書き込み
+    # 2. リストをSOURCEシートに追記
     print(f"\n📄 Spreadsheet ID: {SHARED_SPREADSHEET_ID} / Sheet: {SOURCE_SHEET_NAME}")
     write_news_list_to_source(gc, yahoo_news_articles)
     
-    # 3. DESTシートを準備
+    # 3. DESTシート（当日タブ）を準備
     dest_sh = gc.open_by_key(DEST_SPREADSHEET_ID)
-    today_tab = jst_now().strftime("%y%m%d") # yymmdd 形式のタブ名
+    today_tab = jst_now().strftime("%y%m%d")  # yymmdd 形式のタブ名
     ws = ensure_today_sheet(dest_sh, today_tab)
     print(f"\n📄 DEST Sheet: {today_tab}")
 
@@ -492,8 +512,7 @@ def main():
     added = transfer_a_to_e(gc, ws)
     print(f"📝 DESTシートに新規追加: {added} 行")
     
-    # 5. DESTシートの記事に対して本文・コメントを取得 (F列以降)
-    # 当日タブの全行に対して実行し、前回の未完了分もカバーします。
+    # 5. 当日タブの記事に対して本文・コメントを取得 (F列以降)
     if ws.get_all_values(value_render_option='UNFORMATTED_VALUE'):
         write_bodies_and_comments(ws)
     else:
